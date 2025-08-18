@@ -1072,22 +1072,22 @@ namespace Plang.Compiler
         public static IEnumerable<(string, int, int, Hint, HashSet<string>, HashSet<string>)> GetSortedInvariants()
         {
             ComputeFiltersFrequency();
-            List<((string, int, int, Hint, HashSet<string>, HashSet<string>), decimal)> result = [];
+            List<((string, int, int, Hint, HashSet<string>, HashSet<string>), double)> result = [];
             foreach (var (key, n, e, h, p, q) in AllExecuedAndMined())
             {
-                decimal weight = 0;
+                decimal weight = 1;
                 var quantified = h.QuantifiedEvents().ToHashSet();
                 foreach (var ap in q)
                 {
                     if (GetFrequency(key, quantified, ParsedQ[key][ap], out var freq, out var k))
                     {
                         // Console.WriteLine($"Frequency of {ap}: {freq}");
-                        var numRels = FreeEvents(ParsedQ[key][ap]).Count;
-                        weight += numRels / (decimal)freq;
+                        // var numRels = FreeEvents(ParsedQ[key][ap]).Count;
+                        weight *= 1 / (decimal)freq;
                     }
                 }
                 // Console.WriteLine(h.GetInvariantReprHeader(string.Join(" ∧ ", p), string.Join(" ∧ ", q)) + " " + weight);
-                result.Add(((key, n, e, h, p, q), weight / q.Count));
+                result.Add(((key, n, e, h, p, q), Math.Pow((double) weight, -q.Count)));
             }
             return result.OrderByDescending(x => x.Item2).Select(x => x.Item1);
         }
