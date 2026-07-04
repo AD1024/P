@@ -28,6 +28,7 @@ Inhabited, DecidableEq`, satisfying the prerequisites.
 import Mathlib.Data.Set.Basic
 import Mathlib.Data.Set.Insert
 import PLean.Verify.SimpAttrs
+import PLean.Semantics.PSet
 
 namespace PLean
 
@@ -93,6 +94,9 @@ class PContainerErase (C : Type) (E : outParam Type) where
 
 instance {T : Type} [DecidableEq T] : PContainerErase (Set T) T where
   erase s e := s \ Set.singleton e
+
+noncomputable instance {T : Type} : PContainerErase (PSet T) T where
+  erase s e := PSet.erase e s
 
 instance {K V : Type} [DecidableEq K] : PContainerErase (PMap K V) K where
   erase m k := mapErase m k

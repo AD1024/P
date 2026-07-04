@@ -58,6 +58,7 @@ pmodule TwoPhaseCommit
     start state Init {
       entry {
         foreach (p in participants)
+          invariant inv_default : DefaultInvariants s ;
         {
           send p, eVoteReq
         }
@@ -78,7 +79,7 @@ pmodule TwoPhaseCommit
 
       on eNo (resp : tVoteResp) {
         foreach (p in participants)
-          invariant inv_trivial : True ;
+          invariant inv_default : DefaultInvariants s ;
         {
           send p, eAbort
         }
@@ -159,10 +160,12 @@ pmodule TwoPhaseCommit
   }
 
   -- Prove the default framework invariants (`UniqueActions`,
-  -- `IncreasingCount`, `ReceivedSubsetSent`). The Coordinator
-  -- handlers contain `foreach … goto` blocks the auto chain
-  -- can't close on its own; manual `@[pverifyProof]` proofs below
-  -- discharge those via `triple_pforeach_with`.
+  -- `IncreasingCount`, `ReceivedSubsetSent`). The Coordinator handlers
+  -- contain `foreach … goto` blocks. The entry / eNo loops carry an
+  -- `invariant inv_default : DefaultInvariants s` so the auto chain
+  -- discharges their default obligations by SMT; the eYes loop keeps a
+  -- manual `@[pverifyProof]` below (its `+=` / guard interaction trips a
+  -- tactic error when the loop is annotated).
   Proof of_default {
     prove default ;
   }
@@ -216,9 +219,9 @@ The three Coordinator handlers (`Init.entry`, `eYes`, `eNo`) share a
 common structural shape: handler prelude `yesVotes_get`, optional
 container update, `foreach (p in participants) { send p, <ev> }`,
 `goto <state>`. The auto-emitted chain's `wpgen` walk does not
-carry a chosen post (`DefaultInvariants`, `commit_sent`, `safety`)
-through `pforeach` cleanly because the user's trivial loop invariant
-`[True]` does not entail it.
+carry a chosen post (`commit_sent`, `safety`, `votes`, `system_config`)
+through `pforeach` cleanly because the loop's `DefaultInvariants`
+invariant does not entail it.
 
 `triple_pforeach_with` (in `Semantics/Loop.lean`) carries an external
 invariant `Q` across the loop. The proofs below thread `Q` through
@@ -241,8 +244,9 @@ private theorem participant_ne_this
 
 -- `markReceived lbl` preserves `DefaultInvariants` when `lbl` was
 -- in-flight (so adding it to `received` keeps `ReceivedSubsetSent`).
--- Factored out because all three on-handler default proofs share
--- this step verbatim.
+-- Used by the eYes default proof (the entry / eNo loops close by SMT
+-- via their `inv_default` loop invariant; the eYes handler's `+=` and
+-- `if` guard interact badly with a loop annotation, so it stays manual).
 private theorem markReceived_preserves_default
     (lbl : Sig.Label) :
     triple (l := PProp Sig)
@@ -280,104 +284,14 @@ private theorem send_noncommit_preserves_commit_sent
     cases ev <;> simp_all
   · exact hCS e hisE hOld pp hpp
 
-
-
-/-! ## Manual proofs for the foreach-bearing Coordinator handlers.
-
-`Init.entry`, `WaitForResponses.eYes`, and `WaitForResponses.eNo`
-each contain a `foreach (p in participants) { send p, <ev> }` block
-followed by a `goto`. The auto-emitted default chain's `wpgen` walk
-does not carry `DefaultInvariants` through `pforeach` cleanly
-because the user's trivial loop invariant `[True]` does not entail
-it.
-
-`triple_pforeach_with` (in `Semantics/Loop.lean`) carries an external
-invariant `Q` across the loop independently of the user's loop
-invariants. The chain pattern, for each handler:
-
-1. `triple_cons` weakens the precondition (`DefaultInvariants s ∧
-   inflight lbl s` for on-handlers, just `DefaultInvariants` for
-   entry).
-2. `triple_bind` peels each `var_get` / `var_set` / `markReceived`
-   call, each preserving `DefaultInvariants` (closed via `pverify`).
-3. `triple_pforeach_with (Q := DefaultInvariants)` lifts the invariant
-   across the loop, with each iteration's `send p, <ev>` preserving
-   it (closed via `pverify`).
-4. The closing `goto` preserves `DefaultInvariants` (closed via
-   `pverify`).
-
-`markReceived` needs `inflight lbl s` to certify `ReceivedSubsetSent`:
-adding `lbl` to `received` is sound only when `lbl` was sent. The
-`triple_cons` weakening therefore keeps `DefaultInvariants ∧
-inflight lbl s` as the cut for on-handlers. -/
-
--- Init.entry: `foreach … >>= goto WaitForResponses`.
-
-@[pverifyProof]
-theorem Coordinator.Init.entry_correct_of_default_default
-    (this : Coordinator) :
-    triple (l := PProp Sig)
-      (fun s => DefaultInvariants s ∧
-        is_Coordinator this.ref s ∧
-        (s.machines this.ref).currentState = Coordinator.Init_st)
-      (Coordinator.Init.entry this)
-      (fun _ s => DefaultInvariants s) := by
-  apply triple_cons (pre := DefaultInvariants)
-    (post := fun _ => DefaultInvariants)
-  · intro s ⟨h, _, _⟩; exact h
-  · intro _ s h; exact h
-  unfold Coordinator.Init.entry
-  -- Handler prelude: `let yesVotes ← yesVotes_get this.ref`.
-  apply triple_bind (cut := fun _ => DefaultInvariants)
-  · unfold yesVotes_get; pverify
-  intro _
-  apply triple_bind (cut := fun _ => DefaultInvariants)
-  · apply triple_pforeach_with (Q := DefaultInvariants)
-    intro _
-    unfold PLean.send
-    pverify
-  intro _
-  unfold PLean.goto
-  pverify
-
--- WaitForResponses.eNo: markReceived + prelude + foreach + goto.
-
-@[pverifyProof]
-theorem Coordinator.WaitForResponses.eNo_correct_of_default_default
-    (this : Coordinator) (param : eNo_payload) (lbl : Sig.Label) :
-    triple (l := PProp Sig)
-      (fun s => DefaultInvariants s ∧
-        inflight lbl s ∧ lbl.target = this.ref ∧
-        is_Coordinator this.ref s ∧
-        (s.machines this.ref).currentState = Coordinator.WaitForResponses_st ∧
-        lbl.action = EventOrGoto.event (E.eNo param))
-      (do PLean.markReceived (P := Sig) lbl;
-          Coordinator.WaitForResponses.eNo_handler this param)
-      (fun _ s => DefaultInvariants s) := by
-  apply triple_cons
-    (pre := fun s => DefaultInvariants s ∧ inflight lbl s)
-    (post := fun _ => DefaultInvariants)
-  · intro s ⟨h, hInf, _, _, _, _⟩; exact ⟨h, hInf⟩
-  · intro _ s h; exact h
-  apply triple_bind (cut := fun _ => DefaultInvariants)
-  · exact markReceived_preserves_default lbl
-  intro _
-  unfold Coordinator.WaitForResponses.eNo_handler
-  apply triple_bind (cut := fun _ => DefaultInvariants)
-  · unfold yesVotes_get; pverify
-  intro _
-  apply triple_bind (cut := fun _ => DefaultInvariants)
-  · apply triple_pforeach_with (Q := DefaultInvariants)
-    intro _
-    unfold PLean.send
-    pverify
-  intro _
-  unfold PLean.goto
-  pverify
-
--- WaitForResponses.eYes: markReceived + prelude + `+=` macro
--- (get;set;get) + `if` (then: foreach + goto / else: pure ()).
-
+-- WaitForResponses.eYes default: markReceived + prelude + `+=` macro
+-- (get;set;get) + `if` (then: foreach + goto / else: pure ()). Kept
+-- manual: the eYes then-branch loop has no `inv_default` annotation
+-- (adding one trips a `default_inv` tactic error via the `+=` / guard
+-- interaction), so the auto chain can't carry `DefaultInvariants`
+-- through the loop. The `triple_pforeach_with (Q := DefaultInvariants)`
+-- step below lifts it explicitly. The entry / eNo default obligations
+-- close by SMT from their `inv_default` loop invariants.
 @[pverifyProof]
 theorem Coordinator.WaitForResponses.eYes_correct_of_default_default
     (this : Coordinator) (param : eYes_payload) (lbl : Sig.Label) :
@@ -555,7 +469,7 @@ theorem Coordinator.WaitForResponses.eYes_correct_of_votes_votes
       intro c hcKind p hmem
       by_cases hct : c.ref = this.ref
       · rw [if_pos hct] at hmem
-        simp only [decide_eq_true_eq] at hmem
+        simp only [PSet.mem_def, PSet.insert_eq, PSet.mem_insert] at hmem
         rcases hmem with rfl | hold
         · exact hPref
         · exact hYvPref p hold
@@ -930,7 +844,7 @@ theorem Coordinator.WaitForResponses.eYes_correct_of_commit_sent_commit_sent_usi
       is_Coordinator this.ref s ∧
       (∀ (c : Coordinator), is_Coordinator c.ref s →
         ∀ p : PLean.MachineRef,
-          s.containers.Coordinator_yesVotes (c.ref, p) = true → preference p = true) ∧
+          p ∈ s.containers.Coordinator_yesVotes c.ref → preference p = true) ∧
       preference param.source = true)
     (post := fun _ => commit_sent)
   · rintro s ⟨⟨hCS, hV, hSC⟩, hInfl, _, hCo, _, hAct⟩
@@ -943,7 +857,7 @@ theorem Coordinator.WaitForResponses.eYes_correct_of_commit_sent_commit_sent_usi
       is_Coordinator this.ref s ∧
       (∀ (c : Coordinator), is_Coordinator c.ref s →
         ∀ p : PLean.MachineRef,
-          s.containers.Coordinator_yesVotes (c.ref, p) = true → preference p = true) ∧
+          p ∈ s.containers.Coordinator_yesVotes c.ref → preference p = true) ∧
       preference param.source = true)
   · unfold PLean.markReceived commit_sent commit_sent_implies_all_yes
       system_config participant_set
@@ -955,7 +869,7 @@ theorem Coordinator.WaitForResponses.eYes_correct_of_commit_sent_commit_sent_usi
       is_Coordinator this.ref s ∧
       (∀ (c : Coordinator), is_Coordinator c.ref s →
         ∀ p : PLean.MachineRef,
-          s.containers.Coordinator_yesVotes (c.ref, p) = true → preference p = true) ∧
+          p ∈ s.containers.Coordinator_yesVotes c.ref → preference p = true) ∧
       preference param.source = true)
   · unfold Coordinator.yesVotes_get commit_sent commit_sent_implies_all_yes
       system_config participant_set
@@ -967,7 +881,7 @@ theorem Coordinator.WaitForResponses.eYes_correct_of_commit_sent_commit_sent_usi
       is_Coordinator this.ref s ∧
       (∀ (c : Coordinator), is_Coordinator c.ref s →
         ∀ p : PLean.MachineRef,
-          s.containers.Coordinator_yesVotes (c.ref, p) = true → preference p = true) ∧
+          p ∈ s.containers.Coordinator_yesVotes c.ref → preference p = true) ∧
       preference param.source = true ∧ (∀ z, yv z → preference z = true))
   · unfold Coordinator.yesVotes_get commit_sent commit_sent_implies_all_yes
       system_config participant_set
@@ -980,7 +894,7 @@ theorem Coordinator.WaitForResponses.eYes_correct_of_commit_sent_commit_sent_usi
       is_Coordinator this.ref s ∧
       (∀ (c : Coordinator), is_Coordinator c.ref s →
         ∀ p : PLean.MachineRef,
-          s.containers.Coordinator_yesVotes (c.ref, p) = true → preference p = true))
+          p ∈ s.containers.Coordinator_yesVotes c.ref → preference p = true))
   · unfold Coordinator.yesVotes_set commit_sent commit_sent_implies_all_yes
       system_config participant_set
     pverify_step_wp
@@ -990,7 +904,7 @@ theorem Coordinator.WaitForResponses.eYes_correct_of_commit_sent_commit_sent_usi
     · intro c hcKind p hmem
       by_cases hct : c.ref = this.ref
       · rw [if_pos hct] at hmem
-        simp only [decide_eq_true_eq] at hmem
+        simp only [PSet.mem_def, PSet.insert_eq, PSet.mem_insert] at hmem
         rcases hmem with rfl | hold
         · exact hPref
         · exact hYvPref p hold
@@ -1092,7 +1006,7 @@ theorem Coordinator.Init.entry_correct_of_safety_safety_using_commit_sent
   unfold Coordinator.Init.entry
   show triple (l := PProp Sig) _ (Coordinator.yesVotes_get this.ref >>= fun _ => _) _
   apply triple_bind
-    (cut := fun _ : Set MachineRef =>
+    (cut := fun _ : PSet MachineRef =>
       (fun s => safety s ∧ is_Coordinator this.ref s : PProp Sig))
   · unfold Coordinator.yesVotes_get
     pverify_step_wp
@@ -1153,7 +1067,7 @@ theorem Coordinator.WaitForResponses.eNo_correct_of_safety_safety_using_commit_s
     (yesVotes_get this.ref >>= fun _ => _) _
   apply triple_bind
     (pre := (fun s => safety s ∧ is_Coordinator this.ref s : PProp Sig))
-    (cut := fun _ : Set MachineRef =>
+    (cut := fun _ : PSet MachineRef =>
       (fun s => safety s ∧ is_Coordinator this.ref s : PProp Sig))
     (post := fun _ s => safety s)
   · unfold yesVotes_get
@@ -1225,7 +1139,7 @@ theorem Coordinator.WaitForResponses.eYes_correct_of_safety_safety_using_commit_
     (yesVotes_get this.ref >>= fun _ => _) _
   apply triple_bind
     (pre := (fun s => safety s ∧ is_Coordinator this.ref s : PProp Sig))
-    (cut := fun _ : Set MachineRef =>
+    (cut := fun _ : PSet MachineRef =>
       (fun s => safety s ∧ is_Coordinator this.ref s : PProp Sig))
     (post := fun _ s => safety s)
   · unfold yesVotes_get
@@ -1238,7 +1152,7 @@ theorem Coordinator.WaitForResponses.eYes_correct_of_safety_safety_using_commit_
     (yesVotes_get this.ref >>= fun _ => _) _
   apply triple_bind
     (pre := (fun s => safety s ∧ is_Coordinator this.ref s : PProp Sig))
-    (cut := fun _ : Set MachineRef =>
+    (cut := fun _ : PSet MachineRef =>
       (fun s => safety s ∧ is_Coordinator this.ref s : PProp Sig))
     (post := fun _ s => safety s)
   · unfold yesVotes_get
@@ -1268,7 +1182,7 @@ theorem Coordinator.WaitForResponses.eYes_correct_of_safety_safety_using_commit_
     (yesVotes_get this.ref >>= fun _ => _) _
   apply triple_bind
     (pre := (fun s => safety s ∧ is_Coordinator this.ref s : PProp Sig))
-    (cut := fun _ : Set MachineRef =>
+    (cut := fun _ : PSet MachineRef =>
       (fun s => safety s ∧ is_Coordinator this.ref s : PProp Sig))
     (post := fun _ s => safety s)
   · unfold yesVotes_get

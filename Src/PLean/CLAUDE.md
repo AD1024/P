@@ -101,6 +101,11 @@ Tests/               -- regressions; Tests.** is globbed
 - [`docs/ProofSkill.md`](docs/ProofSkill.md) — practical workflow for
   finding inductive invariants, writing manual proofs, and coping with
   SMT complexity (higher-order rejection, bundle sizing, `using` chains).
+- [`docs/LEAN_AUTO_SUPPORT.md`](docs/LEAN_AUTO_SUPPORT.md) — every
+  technique that keeps obligations first-order for lean-auto (the
+  `pverifySimp` set, state destructure, `PSet` container theory, axiom
+  lifting, loop annotation) + a failure-diagnosis table and cache
+  discipline.
 
 ## Verification benchmarks
 
@@ -160,12 +165,23 @@ the WP spec (registered as `@[loomSpec]`) gives the verifier `0 ≤ x
 
 ### Container types
 
-Surface macros: `set[T]` → `Set T`, `map[K, V]` → `K → Option V`,
+Surface macros: `set[T]` → `PLean.PSet T`, `map[K, V]` → `K → Option V`,
 `seq[T]` → `List T` (no SMT), `option[T]` → `Option T`. Mutation
 macros: `s += (e)`, `s -= (e)`, `m[k] = v`, `m[k] += (e)`,
 `m[k] -= (e)`. Lookup-after-mutation lemmas are tagged
 `@[pverifySimp]` so SMT prep reduces post-state lookups directly.
 See [`Examples/ShardedKV.lean`](Examples/ShardedKV.lean).
+
+`PSet` (`Semantics/PSet.lean`) is P's `set[T]` as a first-order sort: a
+`Set`-backed `def` whose membership/insert/empty/erase spec lemmas are
+proven as theorems, then sealed `@[irreducible]` so lean-auto treats
+`PSet.mem`/`PSet` as an uninterpreted relation/sort — the encoding
+UCLID5/PVerifier use for sets, with an empty trusted base. Membership
+`a ∈ n.<v>`, applicative `n.<v> a` (via `CoeFun`), and whole-set
+predicates (`isQuorum n.<v>`) all translate first-order. A `PSet` must
+NOT appear as a struct field reachable from `GlobalState`; `set[T]` vars
+therefore hoist into `Containers` as a whole-value row `MachineRef →
+PSet T` (see below).
 
 ### Loops (`foreach` / `while`)
 
@@ -203,13 +219,18 @@ load-bearing invariants you need to respect when editing.
   becomes `∀ n : <M>, is_<M> n.ref s → body` (and similarly for `∃`
   and event quantifiers). Skipped when the body already mentions the
   guard. Pinned by `Tests/Syntax/SoundnessRegression.lean`.
-- **Container `var`s are hoisted into `Containers`.** `set[T]` /
-  `map[K, V]` vars hoist out of `Fields` into a per-pmodule
-  `Containers` struct uncurried with `MachineRef`, so `n.<v>`
-  reduces to a flat applied symbol lean-auto can translate.
-  `seq[T]` and first-order vars stay in `Fields`. Mirrors
-  PVerifier's UCLID5 2D-array layout. Exercised by
-  [`Examples/ShardedKV`](Examples/ShardedKV.lean).
+- **Container `var`s are hoisted into `Containers`.** `map[K, V]`
+  vars hoist out of `Fields` into a per-pmodule `Containers` struct
+  uncurried with `MachineRef` (`MachineRef × K → Option V`), so
+  `n.<v>` reduces to a flat applied symbol lean-auto can translate —
+  PVerifier's UCLID5 2D-array layout. `set[T]` (`PSet T`) vars also
+  hoist, but as a **whole-value row** `MachineRef → PSet T` (no
+  `(ref, elem)` uncurry): `PSet` is already a first-order sort, and it
+  must not be a `Fields`/`MachineState` struct field (the enclosing
+  datatype translation would choke). `seq[T]` and first-order vars
+  stay in `Fields`. Exercised by
+  [`Examples/ShardedKV`](Examples/ShardedKV.lean) (map) and
+  [`Examples/Consensus`](Examples/Consensus.lean) (set).
 - **`MachineRef := Nat`; per-machine type is a wrapper.** Dynamic
   kind check (`<M>_allocated`, public alias `is_<M>`) goes through
   a `Nat` kind tag plus `currentState ∈ <M>'s states` (load-bearing

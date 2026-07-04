@@ -16,7 +16,7 @@ namespace PLean.Tests.Containers
 
 /-! ## Surface macros: type-level desugaring -/
 
-example : set[Nat] = Set Nat := rfl
+example : set[Nat] = PSet Nat := rfl
 example : seq[Nat] = List Nat := rfl
 example : map[Nat, Nat] = PMap Nat Nat := rfl
 example : map[Nat, Nat] = (Nat → Option Nat) := rfl

@@ -689,6 +689,7 @@ private def buildFieldProjection
     (machineFields : NameMap NameSet)
     (machineContainerFields : NameMap NameSet)
     (machineSetPropFields : NameMap NameSet)
+    (machinePSetFields : NameMap NameSet)
     (eventPayloadFields : NameMap NameSet)
     (sBinder : Name) (binder : Ident) (field : Name) (kind : KindRef) :
     MacroM (Option (TSyntax `term)) := do
@@ -702,19 +703,30 @@ private def buildFieldProjection
     -- under any quantifier (matches PVerifier's UCLID5 2D-array
     -- encoding).
     --
-    -- `set[T]` vars store `Bool` (Prop-codomain trips lean-auto);
-    -- the projection wraps the Bool lookup as `... = true` so the
-    -- surface invariant body still sees `n.<v> : T → Prop` (= `Set
-    -- T`). The lambda itself never appears applied-to-nothing in
-    -- well-formed invariants: every container access feeds a
-    -- membership check, lookup, or update at the same syntactic
-    -- depth.
+    -- `set[T]` vars (`PSet T`) store the *whole set* per machine
+    -- (`MachineRef → PSet T`): `PSet` is a sealed first-order sort, so
+    -- `n.<v>` projects to `s.containers.<M>_<v> n.ref` — a `PSet T`
+    -- value. Membership `a ∈ n.<v>` and whole-set predicates
+    -- (`isQuorum n.<v>`) both stay first-order. No uncurry, unlike the
+    -- map case.
+    --
+    -- The legacy `set[T] = T → Prop` Bool-array encoding
+    -- (`machineSetPropFields`) is unreachable via the current surface
+    -- but kept for a raw `Set`-typed `var`: it stores `Bool` and the
+    -- projection wraps the lookup as `… = true`.
     if let some cflds := machineContainerFields.find? mName then
       if cflds.contains field then
         let sIdent : Ident := mkIdent sBinder
         let qualField : Ident :=
           mkIdent (Name.mkSimple (mName.toString ++ "_" ++ field.toString))
         let xId : Ident := mkIdent `x
+        let isPSet :=
+          match machinePSetFields.find? mName with
+          | some s => s.contains field
+          | none   => false
+        if isPSet then
+          -- Whole-value projection: `n.<v> : PSet T`.
+          return some (← `(($sIdent).containers.$qualField:ident ($binder).ref))
         let isSet :=
           match machineSetPropFields.find? mName with
           | some s => s.contains field
@@ -750,6 +762,7 @@ private partial def rewriteFieldProjectionsAux
     (machineFields : NameMap NameSet)
     (machineContainerFields : NameMap NameSet)
     (machineSetPropFields : NameMap NameSet)
+    (machinePSetFields : NameMap NameSet)
     (eventPayloadFields : NameMap NameSet)
     (sBinder : Name) (kindEnv : NameMap KindRef)
     (stx : Syntax) : MacroM Syntax := do
@@ -769,7 +782,7 @@ private partial def rewriteFieldProjectionsAux
         let bIdent : Ident := ⟨lhs⟩
         let rebuilt? ← buildFieldProjection
           machineFields machineContainerFields machineSetPropFields
-          eventPayloadFields sBinder bIdent fName kind
+          machinePSetFields eventPayloadFields sBinder bIdent fName kind
         if let some out := rebuilt? then
           return out.raw
   if stx.isIdent then
@@ -781,7 +794,7 @@ private partial def rewriteFieldProjectionsAux
         let bIdent : Ident := mkIdent headN
         let rebuilt? ← buildFieldProjection
           machineFields machineContainerFields machineSetPropFields
-          eventPayloadFields sBinder bIdent fieldN kind
+          machinePSetFields eventPayloadFields sBinder bIdent fieldN kind
         if let some out := rebuilt? then
           return out.raw
     | _ => pure ()
@@ -799,8 +812,8 @@ private partial def rewriteFieldProjectionsAux
         env := env.insert xRaw.getId (.event tName)
   let args' ← stx.getArgs.mapM
     (rewriteFieldProjectionsAux machineKinds eventKinds machineFields
-      machineContainerFields machineSetPropFields eventPayloadFields
-      sBinder env)
+      machineContainerFields machineSetPropFields machinePSetFields
+      eventPayloadFields sBinder env)
   return stx.setArgs args'
 
 def rewriteFieldProjections
@@ -808,16 +821,18 @@ def rewriteFieldProjections
     (machineFields : NameMap NameSet)
     (machineContainerFields : NameMap NameSet)
     (machineSetPropFields : NameMap NameSet)
+    (machinePSetFields : NameMap NameSet)
     (eventPayloadFields : NameMap NameSet)
     (sBinder : Name) (stx : Syntax) : MacroM Syntax :=
   rewriteFieldProjectionsAux machineKinds eventKinds machineFields
-    machineContainerFields machineSetPropFields eventPayloadFields
-    sBinder {} stx
+    machineContainerFields machineSetPropFields machinePSetFields
+    eventPayloadFields sBinder {} stx
 
 def materialiseInvariant (machineKinds eventKinds : NameSet)
     (machineFields : NameMap NameSet)
     (machineContainerFields : NameMap NameSet)
     (machineSetPropFields : NameMap NameSet)
+    (machinePSetFields : NameMap NameSet)
     (eventPayloadFields : NameMap NameSet)
     (d : PInvariantDecl) : CommandElabM Unit := do
   match d.defStx with
@@ -839,7 +854,7 @@ def materialiseInvariant (machineKinds eventKinds : NameSet)
         let rewritten ← liftMacroM <|
           rewriteFieldProjections machineKinds eventKinds
             machineFields machineContainerFields machineSetPropFields
-            eventPayloadFields sName prop.raw
+            machinePSetFields eventPayloadFields sName prop.raw
         let stxOut ← liftMacroM <|
           injectKindGuards machineKinds eventKinds sName rewritten
         pure ⟨stxOut⟩
@@ -848,10 +863,27 @@ def materialiseInvariant (machineKinds eventKinds : NameSet)
       @[reducible] def $id : ($gsTy $sigId) → Prop := fun $binderIdent => $prop')
     elabCommand cmd
 
+/-- Leftmost atomic component of a (possibly dotted) name: `s.machines`
+→ `s`, `s` → `s`. -/
+private def leftmostComponent : Name → Name
+  | .str .anonymous s => Name.mkSimple s
+  | .str p _          => leftmostComponent p
+  | n                 => n
+
+/-- Whether `stx` mentions the identifier `name` anywhere, including as
+the head of a dotted projection (`n.held` where `n = name`). Used to
+decide whether a `paxiom` body actually depends on the state binder. -/
+private partial def syntaxMentionsName (name : Name) (stx : Syntax) : Bool :=
+  if stx.isIdent then
+    leftmostComponent stx.getId == name
+  else
+    stx.getArgs.any (syntaxMentionsName name)
+
 def materialiseAxiom (machineKinds eventKinds : NameSet)
     (machineFields : NameMap NameSet)
     (machineContainerFields : NameMap NameSet)
     (machineSetPropFields : NameMap NameSet)
+    (machinePSetFields : NameMap NameSet)
     (eventPayloadFields : NameMap NameSet)
     (d : PAxiomDecl) : CommandElabM Unit := do
   match d.defStx with
@@ -859,7 +891,19 @@ def materialiseAxiom (machineKinds eventKinds : NameSet)
   | some stx =>
     let `(paxiom $id:ident : $prop:term) := stx
       | throwErrorAt stx "internal error: paxiom defStx malformed"
-    match d.stateBinder with
+    -- A `system <σ>` pmodule whose axiom body never names `<σ>` is
+    -- state-independent: emit it verbatim, WITHOUT the `∀ <σ> :
+    -- GlobalState Sig` wrapper. The wrapper is not merely redundant —
+    -- after `sdestruct_state` destructures the bound state into its
+    -- fields, the resulting `containers : Containers` binder is a struct
+    -- carrying function-typed (`PSet` / array) fields that lean-auto
+    -- rejects ("Higher order input?"), poisoning every obligation this
+    -- axiom is lifted into. A closed body (e.g. a `set[T]`-quantified
+    -- topology axiom like Consensus's `quorum_intersect`) needs none of
+    -- the state plumbing.
+    let stateBinder? :=
+      d.stateBinder.filter (syntaxMentionsName · prop.raw)
+    match stateBinder? with
     | none =>
       elabCommand (← `(axiom $id : $prop))
     | some sName =>
@@ -874,7 +918,7 @@ def materialiseAxiom (machineKinds eventKinds : NameSet)
       let rewritten ← liftMacroM <|
         rewriteFieldProjections machineKinds eventKinds
           machineFields machineContainerFields machineSetPropFields
-          eventPayloadFields sName prop.raw
+          machinePSetFields eventPayloadFields sName prop.raw
       let guarded ← liftMacroM <|
         injectKindGuards machineKinds eventKinds sName rewritten
       let prop' : TSyntax `term := ⟨guarded⟩
