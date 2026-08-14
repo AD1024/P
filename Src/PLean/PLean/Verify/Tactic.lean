@@ -672,14 +672,9 @@ def pverifyCacheInsert (hash : String) (humanText : String) : IO Unit := do
 
 register_option pverify.cache : Bool := {
   defValue := true
-  descr := "If true (default), `#pverify` caches obligations already \
-            certified `unsat` in <project>/.lake/build/pverify_cache/. \
-            On a hit, the obligation is closed directly via the \
-            Crush.crushSorry axiom — bypassing pverify_smt_prep and \
-            Crush. The cache is disabled when crush.trust requests \
-            reconstruction. Hashing \
-            is by elaborated obligation `Expr`, so unrelated edits to \
-            the same file don't invalidate. Reset with `lake clean`."
+  descr := "Retained for compatibility with the other PLean backend branches. \
+            The Duper backend always produces a proof and does not use the \
+            trusted obligation cache."
 }
 
 register_option pverify.profile : Bool := {
@@ -710,19 +705,30 @@ def pverifySmtCloseDefault : TacticM Unit := do
   unless (← getGoals).isEmpty do
     evalTactic (← `(tactic| all_goals duper [*]))
 
+private def recordProfiledTactic (key : String)
+    (record : PLean.Verify.Profile.Row → Nat → PLean.Verify.Profile.Row)
+    (act : TacticM Unit) : TacticM Unit := do
+  let started ← IO.monoNanosNow
+  try
+    act
+  catch ex =>
+    let elapsed := (← IO.monoNanosNow) - started
+    liftM (m := IO) (PLean.Verify.Profile.modifyRow key (record · elapsed))
+    throw ex
+  let elapsed := (← IO.monoNanosNow) - started
+  liftM (m := IO) (PLean.Verify.Profile.modifyRow key (record · elapsed))
+
 /-- Instrumented path. Records preprocessing and Duper time under the
 current obligation's key. -/
 def pverifySmtCloseProfiled : TacticM Unit := do
   let key ← currentObligationKey
-  let (_, prepNs) ← PLean.Verify.Profile.timeTacticNanos
+  recordProfiledTactic key
+    (fun r elapsed => { r with smtPrep := r.smtPrep + elapsed })
     (evalTactic (← `(tactic| pverify_smt_prep)))
-  liftM (m := IO) (PLean.Verify.Profile.modifyRow key (fun r =>
-    { r with smtPrep := r.smtPrep + prepNs }))
   unless (← getGoals).isEmpty do
-    let (_, duperNs) ← PLean.Verify.Profile.timeTacticNanos
+    recordProfiledTactic key
+      (fun r elapsed => { r with smtDuper := r.smtDuper + elapsed })
       (evalTactic (← `(tactic| all_goals duper [*])))
-    liftM (m := IO) (PLean.Verify.Profile.modifyRow key (fun r =>
-      { r with smtDuper := r.smtDuper + duperNs }))
 
 syntax "pverify_smt" : tactic
 elab_rules : tactic
