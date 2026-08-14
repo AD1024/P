@@ -26,6 +26,7 @@ helper. The obligation generator and manual proofs both call the named
 tactics; bare lemma references would get hygiene marks at expansion.
 -/
 import Lean
+import Duper
 import Loom.MonadAlgebras.WP.Basic
 import Loom.MonadAlgebras.WP.Tactic
 import Loom.SMT
@@ -683,111 +684,45 @@ register_option pverify.cache : Bool := {
 
 register_option pverify.profile : Bool := {
   defValue := false
-  descr := "If true, `pverify_smt` instruments cache lookup, prep, and \
-            the public crush call with \
+  descr := "If true, `pverify_smt` instruments prep and the Duper call with \
             `IO.monoNanosNow` timers and records \
             into `PLean.Verify.Profile.stateRef`. `#pverify` emits a \
-            summary table on completion. Use crush.profile for finer \
-            translation/solver/reconstruction timings."
+            summary table on completion."
 }
 
 /-! ## SMT discharge
 
-`pverify_smt` consults the obligation cache, then on miss runs
-`pverify_smt_prep; crush [*]`. Both profile modes use the public
-`crush` tactic; the profiled path only wraps its phases with timers.
-
-Crush may log profiling information on success. Under `#pverify` the
-command's consolidated report subsumes per-obligation info, so the elab
-below drops new info-severity messages (errors/warnings kept).
+`pverify_smt` runs `pverify_smt_prep; duper [*]`. The profiled path
+only wraps those phases with timers. Under `#pverify`, the command's
+consolidated report subsumes per-obligation info, so the elaborator
+drops new info-severity messages while retaining errors and warnings.
 -/
 
-/-- Default (unprofiled) path: identical to the pre-profile-instrumentation
-behaviour. Consults the cache, then runs `pverify_smt_prep; crush [*]`
-on a miss. The `prep` step itself sometimes closes the goal (via
+/-- Default (unprofiled) path. Runs `pverify_smt_prep; duper [*]`.
+The `prep` step itself sometimes closes the goal (via
 `simp` on a tautology, container-lemma rewrite landing in `True`,
-etc.), so `crush` is gated on the prep leaving a non-empty goal
+etc.), so Duper is gated on the prep leaving a non-empty goal
 queue. Without the gate the post-prep run would error
 "No goals to be solved" and clobber a more meaningful upstream
 diagnostic. -/
 def pverifySmtCloseDefault : TacticM Unit := do
-  let opts ← getOptions
-  let useCache := pverify.cache.get opts && crush.trust.get opts == .trust
-  let mv ← getMainGoal
-  let goalType ← mv.getType
-  let cacheHash? : Option (String × String) ←
-    if useCache then
-      try
-        let text ← pverifyGoalToCacheText mv
-        pure (some (pverifyHash text, text))
-      catch _ => pure none
-    else pure none
-  let cacheHit : Bool ←
-    match cacheHash? with
-    | some (hash, _) =>
-      if (← liftM (pverifyCacheHas hash)) then
-        mv.assign (mkApp (mkConst ``Crush.crushSorry) goalType)
-        pure true
-      else pure false
-    | none => pure false
-  unless cacheHit do
-    evalTactic (← `(tactic| pverify_smt_prep))
-    unless (← getGoals).isEmpty do
-      evalTactic (← `(tactic| all_goals crush [*]))
-    if let some (hash, text) := cacheHash? then
-      liftM (pverifyCacheInsert hash text)
+  evalTactic (← `(tactic| pverify_smt_prep))
+  unless (← getGoals).isEmpty do
+    evalTactic (← `(tactic| all_goals duper [*]))
 
-/-- Instrumented path. Records cache, prep, and the complete public
-`crush` call into `PLean.Verify.Profile.inFlightRowsRef` under this
-obligation's key. -/
+/-- Instrumented path. Records preprocessing and Duper time under the
+current obligation's key. -/
 def pverifySmtCloseProfiled : TacticM Unit := do
-  let opts ← getOptions
-  let useCache := pverify.cache.get opts && crush.trust.get opts == .trust
   let key ← currentObligationKey
-  let mv ← getMainGoal
-  let goalType ← mv.getType
-  let cacheHash? : Option (String × String) ←
-    if useCache then
-      try
-        let (text, ppNs) ← liftM (m := MetaM)
-          (PLean.Verify.Profile.timeMetaNanos (pverifyGoalToCacheText mv))
-        liftM (m := IO) (PLean.Verify.Profile.modifyRow key
-          (fun r => { r with cachePp := r.cachePp + ppNs }))
-        let (h, hashNs) ← liftM (m := IO)
-          (PLean.Verify.Profile.timeNanos (pure (pverifyHash text)))
-        liftM (m := IO) (PLean.Verify.Profile.modifyRow key
-          (fun r => { r with cacheHash := r.cacheHash + hashNs }))
-        pure (some (h, text))
-      catch _ => pure none
-    else pure none
-  let cacheHit : Bool ←
-    match cacheHash? with
-    | some (hash, _) =>
-      let (hit, fsNs) ← liftM (m := IO)
-        (PLean.Verify.Profile.timeNanos (pverifyCacheHas hash))
-      liftM (m := IO) (PLean.Verify.Profile.modifyRow key
-        (fun r => { r with cacheFs := r.cacheFs + fsNs }))
-      if hit then
-        let (_, assignNs) ← liftM (m := MetaM)
-          (PLean.Verify.Profile.timeMetaNanos
-            (mv.assign (mkApp (mkConst ``Crush.crushSorry) goalType)))
-        liftM (m := IO) (PLean.Verify.Profile.modifyRow key (fun r =>
-          { r with cached := true, cacheClose := r.cacheClose + assignNs }))
-        pure true
-      else pure false
-    | none => pure false
-  unless cacheHit do
-    let (_, prepNs) ← PLean.Verify.Profile.timeTacticNanos
-      (evalTactic (← `(tactic| pverify_smt_prep)))
+  let (_, prepNs) ← PLean.Verify.Profile.timeTacticNanos
+    (evalTactic (← `(tactic| pverify_smt_prep)))
+  liftM (m := IO) (PLean.Verify.Profile.modifyRow key (fun r =>
+    { r with smtPrep := r.smtPrep + prepNs }))
+  unless (← getGoals).isEmpty do
+    let (_, duperNs) ← PLean.Verify.Profile.timeTacticNanos
+      (evalTactic (← `(tactic| all_goals duper [*])))
     liftM (m := IO) (PLean.Verify.Profile.modifyRow key (fun r =>
-      { r with smtPrep := r.smtPrep + prepNs }))
-    unless (← getGoals).isEmpty do
-      let (_, crushNs) ← PLean.Verify.Profile.timeTacticNanos
-        (evalTactic (← `(tactic| all_goals crush [*])))
-      liftM (m := IO) (PLean.Verify.Profile.modifyRow key (fun r =>
-        { r with smtCrush := r.smtCrush + crushNs }))
-    if let some (hash, text) := cacheHash? then
-      liftM (m := IO) (pverifyCacheInsert hash text)
+      { r with smtDuper := r.smtDuper + duperNs }))
 
 syntax "pverify_smt" : tactic
 elab_rules : tactic
@@ -815,7 +750,7 @@ syntax "pverify_structural_smt" : tactic
 macro_rules
   | `(tactic| pverify_structural_smt) => `(tactic| (
       pverify_smt_prep_structural
-      all_goals crush [*]
+      all_goals duper [*]
     ))
 
 /-- Arithmetic / boolean fallback for default-invariant goals SMT

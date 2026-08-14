@@ -2,9 +2,11 @@ import Lake
 open Lake DSL System
 
 require Loom from git "https://github.com/AD1024/loom.git"
-  @ "ec16b95ff8bbd047248de031cabd3160847e4b1b"
+  @ "616f9cd8db660dcd74a1c92b0d19bb50420e1c59"
 require crush from git "https://github.com/AD1024/lean-crush.git"
   @ "c1a2e13b2cc84abc1152eed46ad39b9cab328903"
+require Duper from git "https://github.com/leanprover-community/duper.git"
+  @ "ca7c5862bee2e62e019e6a1b70ce95612b6b6365"
 
 package PLean where
   leanOptions := #[⟨`pp.unicode.fun, true⟩]

@@ -11,12 +11,9 @@ Stages recorded per obligation:
 - `cache.fs`    — `IO.FS.pathExists` of the cache file;
 - `cache.close` — assignment of Crush's auditable trust axiom on a hit;
 - `smt.prep`    — `pverify_smt_prep` (defunctionalisation simp chain);
-- `smt.crush`   — the public `crush` call, including translation,
-  solving, and the configured trust or reconstruction policy.
+- `smt.duper`   — the proof-producing Duper call.
 
-The profile path invokes the same public `crush` tactic as the
-unprofiled path. Crush's own `crush.profile` option provides finer
-translation/solver/reconstruction timings when needed.
+The profile path invokes the same Duper tactic as the unprofiled path.
 
 Output: a per-obligation row plus a stage-aggregate table emitted on
 `#pverify` completion. We don't write CSV — the inline `logInfo`
@@ -39,7 +36,7 @@ structure Row where
   cacheFs    : Nat := 0
   cacheClose : Nat := 0
   smtPrep    : Nat := 0
-  smtCrush   : Nat := 0
+  smtDuper   : Nat := 0
   deriving Inhabited
 
 /-- Aggregate state across all obligations of a single `#pverify`
@@ -115,10 +112,10 @@ def padRight (s : String) (w : Nat) : String :=
 
 /-- Render the per-obligation rows table. -/
 def renderRows (rows : Array Row) : String :=
-  let header := s!"  {padRight "obligation" 60}  {padRight "elabCmd" 8}  {padRight "wall" 8}  {padRight "cache.pp" 8}  {padRight "cache.h" 8}  {padRight "cache.fs" 8}  {padRight "cache.cl" 8}  {padRight "prep" 8}  {padRight "crush" 8}  cached"
+  let header := s!"  {padRight "obligation" 60}  {padRight "elabCmd" 8}  {padRight "wall" 8}  {padRight "cache.pp" 8}  {padRight "cache.h" 8}  {padRight "cache.fs" 8}  {padRight "cache.cl" 8}  {padRight "prep" 8}  {padRight "duper" 8}  cached"
   let lines := rows.toList.map fun r =>
-    let wall := r.cachePp + r.cacheHash + r.cacheFs + r.cacheClose + r.smtPrep + r.smtCrush
-    s!"  {padRight r.obligation 60}  {padRight (fmtMs r.elabCmd) 8}  {padRight (fmtMs wall) 8}  {padRight (fmtMs r.cachePp) 8}  {padRight (fmtMs r.cacheHash) 8}  {padRight (fmtMs r.cacheFs) 8}  {padRight (fmtMs r.cacheClose) 8}  {padRight (fmtMs r.smtPrep) 8}  {padRight (fmtMs r.smtCrush) 8}  {r.cached}"
+    let wall := r.cachePp + r.cacheHash + r.cacheFs + r.cacheClose + r.smtPrep + r.smtDuper
+    s!"  {padRight r.obligation 60}  {padRight (fmtMs r.elabCmd) 8}  {padRight (fmtMs wall) 8}  {padRight (fmtMs r.cachePp) 8}  {padRight (fmtMs r.cacheHash) 8}  {padRight (fmtMs r.cacheFs) 8}  {padRight (fmtMs r.cacheClose) 8}  {padRight (fmtMs r.smtPrep) 8}  {padRight (fmtMs r.smtDuper) 8}  {r.cached}"
   String.intercalate "\n" (header :: lines)
 
 /-- Render the stage-aggregate table (totals across all rows). -/
@@ -132,12 +129,12 @@ def renderAggregate (rows : Array Row) : String :=
   let cacheFs   := total Row.cacheFs
   let cacheClose := total Row.cacheClose
   let smtPrep   := total Row.smtPrep
-  let smtCrush  := total Row.smtCrush
+  let smtDuper  := total Row.smtDuper
   -- We report `elabCmd` separately (outer-wall, includes the others) and
   -- the "tactic-time" sum which is elabCmd minus what the tactic stages
   -- captured. That difference reveals where elaboration spends time
   -- outside the SMT path (e.g. theorem-type elaboration, kernel typecheck).
-  let smtSum := cachePp + cacheHash + cacheFs + cacheClose + smtPrep + smtCrush
+  let smtSum := cachePp + cacheHash + cacheFs + cacheClose + smtPrep + smtDuper
   let elabOuter := if elabCmd ≥ smtSum then elabCmd - smtSum else 0
   let grandTotal := if elabCmd > 0 then elabCmd else smtSum
   let pct (n : Nat) : String :=
@@ -152,13 +149,13 @@ def renderAggregate (rows : Array Row) : String :=
     ++ s!"  cache.fs:           {padRight (fmtMs cacheFs) 8} ms  ({pct cacheFs})\n"
     ++ s!"  cache.close:        {padRight (fmtMs cacheClose) 8} ms  ({pct cacheClose})\n"
     ++ s!"  smt.prep:           {padRight (fmtMs smtPrep) 8} ms  ({pct smtPrep})\n"
-    ++ s!"  smt.crush:          {padRight (fmtMs smtCrush) 8} ms  ({pct smtCrush})\n"
+    ++ s!"  smt.duper:          {padRight (fmtMs smtDuper) 8} ms  ({pct smtDuper})\n"
     ++ s!"  total:              {padRight (fmtMs grandTotal) 8} ms"
 
 /-- Render a sorted top-N table (by wall time descending). -/
 def renderTopN (rows : Array Row) (n : Nat) : String :=
   let wallOf (r : Row) : Nat :=
-    r.cachePp + r.cacheHash + r.cacheFs + r.cacheClose + r.smtPrep + r.smtCrush
+    r.cachePp + r.cacheHash + r.cacheFs + r.cacheClose + r.smtPrep + r.smtDuper
   let sorted := rows.toList.toArray.qsort (fun a b => wallOf a > wallOf b)
   let top := sorted.extract 0 (min n sorted.size)
   renderRows top
